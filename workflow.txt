@@ -1,0 +1,164 @@
+flowchart LR
+
+
+%% =============== Contexte & coordination ===============
+subgraph Analyste
+ A0["Intentions - objectifs - perimetre - contraintes"]
+ A9["Feedback : poursuivre - affiner - conclure"]
+end
+
+
+subgraph LLM_Coordinator["LLM coordinateur - planificateur"]
+ L1["Plan HTN - ordonnancement des taches"]
+ L2["Suggestions : requetes - motifs de recherche - ajustement du plan"]
+end
+
+
+%% =============== Agents alignes sur Pirolli ===============
+subgraph Agents
+ F1["Foraging agent : search and filter (etape 2-3)"]
+ E1["Extract agent : read and extract (etape 5)"]
+ R2["Relations agent : search relations (etape 6)"]
+ C2["Structuring agent : build et update KG (etapes 7-8)"]
+ Schem["Schema agent : schematize (etape 8-10)"]
+ H1["Hypothesis agent : generate alternatives (etape 11-13)"]
+ B1["Build case agent : marshaller les preuves (etape 11)"]
+ T1["Test agent : coherence et diagnostic (etapes 9-12-15)"]
+ P1["Presentation agent : reporting (etapes 14-16)"]
+end
+
+
+%% =============== Artefacts Pirolli ===============
+subgraph Artefacts
+ S1["External data sources"]
+ S2["Shoebox - ensemble restreint de docs pertinents"]
+ S3["Evidence file - extraits et faits"]
+ S4["Schema - representation organisee"]
+ S5["Hypotheses - scenarios proposes"]
+ R1["Rapport / presentation finale"]
+end
+
+
+%% =============== Noyau cognitif ===============
+subgraph Cognitive_Core
+ KG["Knowledge Graph - memoire factuelle structuree"]
+ LLM["Large Language Model - raisonnement et langage"]
+end
+
+
+%% =============== Donnees & operateurs BDD ===============
+subgraph Donnees
+ BD["Base de donnees / sources externes / logs"]
+
+
+ subgraph Operateurs_BDD["Operateurs BDD - actions primitives"]
+   direction TB
+   OP1["Lookup - filtre - texte - champs"]
+   OP2["Join - merge - link"]
+   OP3["Aggregate - groupBy - sort - rank"]
+   OP4["Temps - Geo - fenetres - distance"]
+   OP5["Similarite - NLP - embeddings - NER"]
+   OP6["Resolution - deduplication - fuzzy match"]
+   OP7["Export - csv - pdf - vues"]
+ end
+
+
+ OP1 --> BD
+ OP2 --> BD
+ OP3 --> BD
+ OP4 --> BD
+ OP5 --> BD
+ OP6 --> BD
+ OP7 --> BD
+end
+
+
+%% =============== Flux principal aligne Pirolli ===============
+A0 --> L1
+L1 --> F1
+
+
+S1 --> F1
+F1 --> S2
+S2 --> E1
+E1 --> S3
+
+
+S3 --> R2
+R2 --> S3
+
+
+E1 --> C2
+R2 --> C2
+C2 --> KG
+
+
+S3 --> Schem
+KG --> Schem
+Schem --> S4
+
+
+S4 --> H1
+KG --> H1
+H1 --> S5
+
+
+S5 --> B1
+S3 --> B1
+B1 --> T1
+
+
+T1 --> KG
+T1 --> LLM
+T1 --> Schem
+T1 --> P1
+
+
+P1 --> R1
+P1 --> LLM
+P1 --> KG
+
+
+R1 --> A9
+A9 --> L2
+L2 --> F1
+
+
+%% =============== Boucles Pirolli ===============
+F1 --> E1
+E1 --> R2
+R2 --> F1
+
+
+Schem --> H1
+H1 --> B1
+B1 --> T1
+T1 --> Schem
+
+
+T1 --> F1
+
+
+%% =============== Liens agents <-> operateurs ===============
+F1 -.-> OP1
+F1 -.-> OP5
+
+
+E1 -.-> OP1
+E1 -.-> OP5
+
+
+R2 -.-> OP2
+
+
+C2 -.-> OP2
+C2 -.-> OP6
+
+
+H1 -.-> OP3
+B1 -.-> OP3
+T1 -.-> OP4
+
+
+P1 -.-> OP7
+

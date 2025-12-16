@@ -1,0 +1,60 @@
+# Lancer siren (fenetre A)
+cd C:\Users\clem7\Downloads\siren-platform-demo-data-15.0.0-windows-x86_64\siren-platform-demo-data-15.0.0-windows-x86_64
+
+.\start.bat
+
+
+# Test : 
+Test-NetConnection localhost -Port 9220  
+Test-NetConnection localhost -Port 5606
+
+
+cd "C:\Users\clem7\Clement\ENSC\Projets\PFE\siren-mvp"
+.\.venv\Scripts\Activate.ps1
+
+# Lancer FastAPI (fenetre B)
+$env:ES_URL    = "https://localhost:9220"
+$env:ES_USER   = "sirenadmin"
+$env:ES_PASS   = "password"
+$env:ES_VERIFY = "false"
+$env:GRAPH_AGENT_TOKEN = "devtoken"
+$env:OPENAI_API_KEY = ""      #AJOUTER LA CLE AVANT DE TEST
+$env:OPENAI_MODEL   = "gpt-4o-mini"
+$env:CHAT_MODE = "llm"
+
+uvicorn agent.app:app --reload --port 8000
+
+
+# Regler utf8 (Fenetre C)
+chcp 65001 | Out-Null
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+
+# Sanity check
+$auth = @{ Authorization = "Bearer devtoken" }
+Test-NetConnection 127.0.0.1 -Port 8000
+Invoke-RestMethod http://127.0.0.1:8000/docs | Out-Null
+Invoke-RestMethod http://127.0.0.1:8000/graph/indices -Headers $auth |
+  Select-Object index,@{n='docs';e={$_.{'docs.count'}}}
+
+# Executer les 2 requêtes
+$auth = @{ Authorization = "Bearer devtoken" }
+
+# Investissements >= 5M (2010–2015)
+$respA = Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/chat" `
+  -Headers $auth `
+  -ContentType "application/json" `
+  -InFile .\requests\investissements.json
+$respA.answer
+
+# Investisseurs d’Aeropostale
+$respB = Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/chat" `
+  -Headers $auth `
+  -ContentType "application/json" `
+  -InFile .\requests\invest_aeropostale.json
+$respB.answer
+
+
+
+

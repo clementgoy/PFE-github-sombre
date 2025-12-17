@@ -48,6 +48,20 @@ class SpecialistAgent(BaseAgent):
             inv_ids.update(h.get("_source", {}).get("investors", []) or [])
         return inv_ids
 
+    def _fetch_company_labels(self, ids: list[str]) -> dict:
+        if not ids:
+            return {}
+        res = self.es_post("/company/_search", json={"size": len(ids), "query": {"terms": {"id": ids}}})
+        return {h.get("_source", {}).get("id"): h.get("_source", {}).get("label")
+                for h in res.get("hits", {}).get("hits", []) or []}
+
+    def _fetch_investor_labels(self, ids: list[str]) -> dict:
+        if not ids:
+            return {}
+        res = self.es_post("/investor/_search", json={"size": len(ids), "query": {"terms": {"id": ids}}})
+        return {h.get("_source", {}).get("id"): h.get("_source", {}).get("label")
+                for h in res.get("hits", {}).get("hits", []) or []}
+
     # tasks
     def company_investors(self, params: Dict[str, Any]) -> Dict[str, Any]:
         size = int(params.get("size", 5))
@@ -71,8 +85,21 @@ class SpecialistAgent(BaseAgent):
 
         total = res.get("hits", {}).get("total")
         total_val = total.get("value", 0) if isinstance(total, dict) else 0
-        return {"summary": f"{total_val} investisseurs pour {company_id} (top {len(out)}).",
-                "company_id": company_id, "investors": out}
+        if total_val > 0:
+            return {"summary": f"{total_val} investisseurs pour {company_id} (top {len(out)}).",
+                    "company_id": company_id, "investors": out}
+
+        # Fallback si la jointure Federate ne ramène rien : lookup investissements puis investisseurs
+        inv_res = self.es_post("/investment/_search", json={"size": 300, "query": es_query})
+        inv_hits = inv_res.get("hits", {}).get("hits", []) or []
+        inv_ids = []
+        for h in inv_hits:
+            inv_ids.extend(h.get("_source", {}).get("investors", []) or [])
+        inv_ids = list(dict.fromkeys(inv_ids))[:200]
+        labels = self._fetch_investor_labels(inv_ids)
+        out_fb = [{"investor_id": iid, "investor_label": labels.get(iid)} for iid in inv_ids]
+        return {"summary": f"0 via join; fallback sur {len(out_fb)} investisseurs extraits des investissements.",
+                "company_id": company_id, "investors": out_fb}
 
     def investments_by_amount(self, params: Dict[str, Any]) -> Dict[str, Any]:
         size = int(params.get("size", 10))
@@ -98,8 +125,19 @@ class SpecialistAgent(BaseAgent):
                           "company_id": c.get("_source", {}).get("id")} for c in chits]
             total = res.get("hits", {}).get("total")
             total_val = total.get("value", 0) if isinstance(total, dict) else 0
-            return {"summary": f"{total_val} entreprises liées (top {len(companies)}).",
-                    "filters": params, "companies": companies,
+            if total_val > 0:
+                return {"summary": f"{total_val} entreprises liées (top {len(companies)}).",
+                        "filters": params, "companies": companies,
+                        "sample_investments": [x.get("_source", {}) for x in hits[:min(3, len(hits))]]}
+            # Fallback si jointure vide : enrichir via lookup direct sur company
+            comp_ids: list[str] = []
+            for h in hits:
+                comp_ids.extend(h.get("_source", {}).get("companies", []) or [])
+            comp_ids = list(dict.fromkeys(comp_ids))[:size]
+            labels = self._fetch_company_labels(comp_ids)
+            companies_fb = [{"company_label": labels.get(cid), "company_id": cid} for cid in comp_ids]
+            return {"summary": f"0 via join; fallback sur {len(companies_fb)} entreprises issues des investissements.",
+                    "filters": params, "companies": companies_fb,
                     "sample_investments": [x.get("_source", {}) for x in hits[:min(3, len(hits))]]}
         else:
             total = inv.get("hits", {}).get("total")

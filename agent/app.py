@@ -1,6 +1,6 @@
 ﻿# agent/app.py
 # FastAPI + endpoints bas niveau + /chat orchestré par LLM + délégation au SpecialistAgent.
-import os, json, requests
+import os, json, logging, requests
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi import Query as Q
 from pydantic import BaseModel
@@ -25,6 +25,10 @@ AUTH = (os.getenv("ES_USER", "sirenadmin"), os.getenv("ES_PASS", "password"))
 API_TOKEN = os.getenv("GRAPH_AGENT_TOKEN", "devtoken")
 VERIFY_TLS = os.getenv("ES_VERIFY", "false").lower() == "true"
 CHAT_MODE = os.getenv("CHAT_MODE", "llm").lower()
+MAX_STEPS = int(os.getenv("LLM_MAX_STEPS", "12"))
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
 
@@ -40,6 +44,50 @@ class Query(BaseModel):
 def guard(h: str | None):
     if h != f"Bearer {API_TOKEN}":
         raise HTTPException(401, "Unauthorized")
+
+def format_specialist_output(task: str, res: dict) -> str:
+    """
+    Génère une réponse texte lisible à partir du résultat Specialist.
+    """
+    if not isinstance(res, dict):
+        return str(res)
+    summary = res.get("summary") or ""
+    lines = [summary.strip()] if summary else []
+
+    if task == "investments_by_amount":
+        companies = res.get("companies") or []
+        if companies:
+            top = companies[:5]
+            lines.append("Top entreprises : " + ", ".join(
+                f"{c.get('company_label') or c.get('company_id')}" for c in top))
+        samples = res.get("sample_investments") or []
+        if samples:
+            top_inv = samples[:3]
+            desc = []
+            for s in top_inv:
+                desc.append(f"{s.get('label')} ({s.get('funded_year')}, "
+                            f"{s.get('raised_amount')} {s.get('raised_currency_code')})")
+            lines.append("Exemples d'investissements : " + "; ".join(desc))
+    elif task == "company_investors":
+        invs = res.get("investors") or []
+        if invs:
+            top = invs[:5]
+            lines.append("Investisseurs : " + ", ".join(
+                f"{i.get('investor_label') or i.get('investor_id')}" for i in top))
+    return "\n".join([l for l in lines if l])
+def normalize_index(name: str | None) -> str | None:
+    """
+    Normalize common plural/typo variants to the actual index names.
+    Helps when the LLM/user envoie 'investments' au lieu de 'investment'.
+    """
+    if not name:
+        return name
+    mapping = {
+        "investments": "investment",
+        "companies": "company",
+        "investors": "investor",
+    }
+    return mapping.get(name, name)
 
 def es_get(path: str, **kwargs):
     try:
@@ -82,6 +130,8 @@ def get_mapping(index: str = Q(..., min_length=1), authorization: str = Header(N
 @app.post("/graph/query")
 def graph_query(body: Query, authorization: str = Header(None)):
     guard(authorization)
+    body.parent_index = normalize_index(body.parent_index)
+    body.child_index = normalize_index(body.child_index)
     if body.op == "lookup":
         if not body.parent_index:
             raise HTTPException(400, "lookup needs parent_index")
@@ -137,6 +187,32 @@ async def chat(request: Request, authorization: str = Header(None)):
     if not prompt:
         raise HTTPException(400, 'No prompt provided. Send JSON {"prompt":"..."}, text/plain, or ?prompt=...')
 
+    # --- Fastpaths simples pour éviter les boucles LLM sur des requêtes récurrentes ---
+    prompt_l = prompt.lower()
+    specialist = None
+    def ensure_specialist():
+        nonlocal specialist
+        if specialist is None:
+            specialist = SpecialistAgent(es_get, es_post)
+
+    # 1) Investissements >= 1M USD depuis 2010 (join investment->company)
+    if ("investissement" in prompt_l or "investment" in prompt_l) and "2010" in prompt_l:
+        ensure_specialist()
+        res = specialist.run("investments_by_amount", {
+            "min_amount": 1_000_000,
+            "currency_code": "USD",
+            "year_min": 2010,
+            "join_company": True,
+            "size": 50,
+        })
+        return {"mode": "fastpath-specialist", "answer": format_specialist_output("investments_by_amount", res)}
+
+    # 2) Investisseurs d’Aeropostale
+    if "aeropostale" in prompt_l and ("investisseur" in prompt_l or "investor" in prompt_l):
+        ensure_specialist()
+        res = specialist.run("company_investors", {"company_label": "Aeropostale", "size": 5})
+        return {"mode": "fastpath-specialist", "answer": format_specialist_output("company_investors", res)}
+
     if CHAT_MODE != "llm":
         return {"answer": local_plan_summary(), "mode": "local"}
 
@@ -184,26 +260,29 @@ async def chat(request: Request, authorization: str = Header(None)):
     SYSTEM = (
       "Tu planifies façon HTN. Utilise lookup(size<=50) et join quand la paire est claire (on=['companies','id'] "
       "ou ['investors','id']). Pour des requêtes multi-étapes (co-invest, géo, temporalité), appelle call_specialist "
-      "avec le task adapté. Rends un résumé clair (#résultats, éléments saillants) + pistes d’affinage."
+      "avec le task adapté. OBLIGATION: appelle au moins un outil (graph_* ou call_specialist) avant de répondre. "
+      "Si aucune donnée n’est trouvée, dis-le. Rends un résumé clair (#résultats, éléments saillants) + pistes d’affinage."
     )
 
     messages = [{"role":"system","content": SYSTEM},
                 {"role":"user","content": prompt}]
 
     try:
-        for _ in range(8):
+        for step in range(MAX_STEPS):
             resp = client.chat.completions.create(
-                model=model, messages=messages, tools=TOOLS, tool_choice="auto", temperature=0.2
+                model=model, messages=messages, tools=TOOLS, tool_choice="required", temperature=0.2
             )
             msg = resp.choices[0].message
             if not getattr(msg, "tool_calls", None):
-                return {"answer": msg.content, "mode": "llm"}
+                # Si aucune tool_call n'est proposée, on force l'erreur pour éviter les hallucinations.
+                raise HTTPException(502, "LLM n'a pas appelé d'outil; réponse rejetée pour éviter les hallucinations.")
 
             # On ajoute d'abord le message assistant qui porte les tool_calls
             tool_calls_payload = [{
                 "id": tc.id, "type":"function",
                 "function":{"name": tc.function.name, "arguments": tc.function.arguments or "{}"}
             } for tc in msg.tool_calls]
+            logger.info("Tool calls step %s: %s", step, tool_calls_payload)
             messages.append({"role":"assistant","content": msg.content or "", "tool_calls": tool_calls_payload})
 
             # Exécuter chaque outil puis répondre avec un message 'tool'
@@ -219,12 +298,13 @@ async def chat(request: Request, authorization: str = Header(None)):
 
                 elif name == "graph_mapping":
                     idx = args.get("index")
+                    idx = normalize_index(idx)
                     result = es_get(f"/{idx}/_mapping?pretty", timeout=30) if idx else {"error":"index is required"}
 
                 elif name == "graph_query":
                     op = args.get("op")
-                    parent_index = args.get("parent_index")
-                    child_index  = args.get("child_index")
+                    parent_index = normalize_index(args.get("parent_index"))
+                    child_index  = normalize_index(args.get("child_index"))
                     on           = args.get("on")
                     es_q         = args.get("es_query") or {"match_all":{}}
                     size         = int(args.get("size", 50))
@@ -252,7 +332,8 @@ async def chat(request: Request, authorization: str = Header(None)):
 
                 messages.append({"role":"tool","tool_call_id": tc.id,
                                  "name": name, "content": json.dumps(result)[:15000]})
+                logger.info("Tool result %s: %s", name, str(result)[:2000])
 
-        raise HTTPException(500, "LLM did not produce a final answer in 8 steps.")
+        raise HTTPException(500, f"LLM did not produce a final answer in {MAX_STEPS} steps.")
     except Exception as e:
         raise HTTPException(502, f"LLM call failed: {e}")

@@ -19,6 +19,12 @@ except Exception:
     pass
 
 from .agents.specialist import SpecialistAgent
+from .agents.foraging import ForagingAgent
+from .agents.relations import RelationsAgent
+from .agents.structuring import StructuringAgent
+from .core.coordinator import Coordinator
+from .planner import build_plan
+from .path_service import execute_find_paths
 
 ES = os.getenv("ES_URL", "http://localhost:9200")
 AUTH = (os.getenv("ES_USER", "sirenadmin"), os.getenv("ES_PASS", "password"))
@@ -26,6 +32,7 @@ API_TOKEN = os.getenv("GRAPH_AGENT_TOKEN", "devtoken")
 VERIFY_TLS = os.getenv("ES_VERIFY", "false").lower() == "true"
 CHAT_MODE = os.getenv("CHAT_MODE", "llm").lower()
 MAX_STEPS = int(os.getenv("LLM_MAX_STEPS", "12"))
+TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.0"))
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -107,6 +114,14 @@ def es_post(path: str, json=None, **kwargs):
     except requests.RequestException as e:
         raise HTTPException(502, f"ES POST {path} failed: {e}")
 
+# Agents globaux (réutilisés par /chat), initialisés après es_get/es_post
+coordinator = Coordinator(es_get, es_post)
+specialist_global = SpecialistAgent(es_get, es_post)
+coordinator.register_agent("specialist", specialist_global)
+coordinator.register_agent("foraging", ForagingAgent(es_get, es_post))
+coordinator.register_agent("relations", RelationsAgent(es_get, es_post))
+coordinator.register_agent("structuring", StructuringAgent(es_get, es_post))
+
 @app.get("/health")
 def health(authorization: str = Header(None)):
     guard(authorization)
@@ -172,12 +187,23 @@ async def chat(request: Request, authorization: str = Header(None)):
 
     # Récupération du prompt (JSON {"prompt":...}, body texte, ou ?prompt=)
     prompt = None
+    data = None
     try:
         data = await request.json()
         if isinstance(data, dict):
             prompt = data.get("prompt")
     except Exception:
         pass
+    # Exécution directe si payload explicite { "task": "find_paths_between_entities", "params": {...} }
+    if isinstance(data, dict) and data.get("task") == "find_paths_between_entities":
+        exec_res = execute_find_paths(coordinator, data.get("params") or {})
+        return {"answer": exec_res, "mode": "exec-only-direct"}
+
+    # Exécution directe si payload explicite { "find_paths": {...} }
+    if isinstance(data, dict) and data.get("find_paths"):
+        exec_res = execute_find_paths(coordinator, data.get("find_paths") or {})
+        return {"answer": exec_res, "mode": "exec-only-direct"}
+
     if not prompt:
         raw = (await request.body() or b"").decode("utf-8", "ignore").strip()
         if raw and not raw.startswith("{"):
@@ -215,6 +241,87 @@ async def chat(request: Request, authorization: str = Header(None)):
 
     if CHAT_MODE != "llm":
         return {"answer": local_plan_summary(), "mode": "local"}
+
+    # --- Bypass spécifique pour les demandes de chemins / pathfinder ---
+    if any(k in prompt_l for k in ["find_paths_between_entities", "chemin", "path ", "paths ", "lien entre", "connexion entre"]):
+        default_plan = {
+            "action": "FIND_PATHS",
+            "find_paths": {
+                "source_entity": "",
+                "target_entity": "",
+                "depth": 4,
+                "year_from": None,
+                "year_to": None,
+                "currency": None,
+                "max_paths": 10,
+                "type_a": "company",
+                "type_b": "company",
+            }
+        }
+        exec_res = execute_find_paths(coordinator, default_plan["find_paths"])
+        final_system = (
+            "Tu es le rédacteur final. Tu reçois (a) la demande utilisateur, (b) un plan par défaut FIND_PATHS, "
+            "(c) le résultat d’exécution. Tu ne dois appeler aucun outil. Produis la réponse finale directement, avec : "
+            "1) un résumé en 1-3 phrases ; 2) les chemins (numérotés), format 'A -> ... -> B' avec infos année/montant/devise si présentes ; "
+            "3) si aucun chemin, propose 2-3 pistes (élargir période, vérifier entités)."
+        )
+        final_messages = [
+            {"role": "system", "content": final_system},
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": json.dumps({"plan": default_plan, "exec_result": exec_res})},
+        ]
+        try:
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            resp = client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=final_messages,
+                temperature=TEMPERATURE,
+                timeout=30
+            )
+            return {"answer": resp.choices[0].message.content, "mode": "llm-final-bypass", "exec": exec_res}
+        except Exception as e:
+            return {"answer": exec_res, "mode": "exec-only-bypass", "error": str(e)}
+
+    # --- Phase PLAN : obtenir un plan JSON sans tool ---
+    try:
+        plan = build_plan(prompt, model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), temperature=TEMPERATURE, timeout=30)
+    except Exception as e:
+        # fallback direct : plan inconnu
+        return {"answer": "Le service de planification LLM est indisponible ou a expiré. Réessaye ou simplifie la requête.",
+                "mode": "plan-timeout", "error": str(e)}
+
+    # Gestion ASK_CLARIFICATION
+    if plan.action == "ASK_CLARIFICATION":
+        question = plan.clarification_question or "Précisez votre requête."
+        return {"answer": question, "mode": "clarification", "plan": plan.dict()}
+
+    # Gestion FIND_PATHS : exécution déterministe, pas de tool-calling LLM
+    if plan.action == "FIND_PATHS" and plan.find_paths:
+        exec_res = execute_find_paths(coordinator, plan.find_paths.dict())
+        # Phase FINAL : LLM narrateur sans outils
+        final_system = (
+            "Tu es le rédacteur final. Tu reçois (a) la demande utilisateur, (b) le plan JSON, (c) le résultat d’exécution. "
+            "Tu ne dois appeler aucun outil. Produis la réponse finale directement, avec : "
+            "1) un résumé en 1-3 phrases ; 2) les chemins (numérotés), format 'A -> ... -> B' avec infos année/montant/devise si présentes ; "
+            "3) si aucun chemin, propose 2-3 pistes (élargir période, vérifier entités)."
+        )
+        final_messages = [
+            {"role": "system", "content": final_system},
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": json.dumps({"plan": plan.dict(), "exec_result": exec_res})},
+        ]
+        try:
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            resp = client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=final_messages,
+                temperature=TEMPERATURE,
+                timeout=30
+            )
+            return {"answer": resp.choices[0].message.content, "mode": "llm-final", "plan": plan.dict(), "exec": exec_res}
+        except Exception as e:
+            # fallback brut si le LLM final échoue
+            return {"answer": exec_res, "mode": "exec-only", "plan": plan.dict(), "error": str(e)}
 
     if not OPENAI_AVAILABLE:
         raise HTTPException(503, "OpenAI SDK not installed. pip install openai")
@@ -261,7 +368,8 @@ async def chat(request: Request, authorization: str = Header(None)):
       "Tu planifies façon HTN. Utilise lookup(size<=50) et join quand la paire est claire (on=['companies','id'] "
       "ou ['investors','id']). Pour des requêtes multi-étapes (co-invest, géo, temporalité), appelle call_specialist "
       "avec le task adapté. OBLIGATION: appelle au moins un outil (graph_* ou call_specialist) avant de répondre. "
-      "Si aucune donnée n’est trouvée, dis-le. Rends un résumé clair (#résultats, éléments saillants) + pistes d’affinage."
+      "Si aucune donnée n’est trouvée, dis-le. Rends un résumé clair (#résultats, éléments saillants) + pistes d’affinage. "
+      "Pour les chemins/relations entre entités, utilise run_task avec task=find_paths_between_entities et rends la réponse finale."
     )
 
     messages = [{"role":"system","content": SYSTEM},
@@ -270,7 +378,7 @@ async def chat(request: Request, authorization: str = Header(None)):
     try:
         for step in range(MAX_STEPS):
             resp = client.chat.completions.create(
-                model=model, messages=messages, tools=TOOLS, tool_choice="required", temperature=0.2
+                model=model, messages=messages, tools=TOOLS, tool_choice="required", temperature=TEMPERATURE
             )
             msg = resp.choices[0].message
             if not getattr(msg, "tool_calls", None):

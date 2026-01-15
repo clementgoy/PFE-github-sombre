@@ -12,6 +12,12 @@ Test-NetConnection localhost -Port 5606
 cd "C:\Users\clem7\Clement\ENSC\Projets\PFE\siren-mvp"
 .\.venv\Scripts\Activate.ps1
 
+source .venv/bin/activate
+
+./bin/elasticsearch
+
+./bin/investigate
+
 # Lancer FastAPI (fenetre B)
 $env:ES_URL    = "https://localhost:9220"
 $env:ES_USER   = "sirenadmin"
@@ -23,6 +29,9 @@ $env:OPENAI_MODEL   = "gpt-4o-mini"
 $env:CHAT_MODE = "llm"
 
 uvicorn agent.app:app --reload --port 8000
+
+pkill -f "uvicorn agent.app:app --host 0.0.0.0 --port 8000"
+
 
 
 # Regler utf8 (Fenetre C)
